@@ -118,6 +118,26 @@ pub struct Transaction {
     pub message: Message,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct SignatureAndStatus {
+    pub signature: Signature,
+    pub status: Result<()>,
+}
+
+impl Default for SignatureAndStatus {
+    fn default() -> SignatureAndStatus {
+        return SignatureAndStatus {
+            signature: Signature::default(),
+            status: Ok(()),
+        };
+    }
+}
+
+#[derive(Debug, PartialEq, Default, Eq, Clone, Serialize, Deserialize)]
+pub struct SignatureAndStatusColumn {
+    pub statuses: Vec<SignatureAndStatus>,
+}
+
 impl Sanitize for Transaction {
     fn sanitize(&self) -> std::result::Result<(), SanitizeError> {
         if self.message.header.num_required_signatures as usize > self.signatures.len() {

@@ -55,6 +55,7 @@ use std::{
 };
 use thiserror::Error;
 use trees::{Tree, TreeWalk};
+use solana_sdk::transaction::{SignatureAndStatus, SignatureAndStatusColumn};
 
 pub mod blockstore_purge;
 
@@ -127,6 +128,7 @@ pub struct Blockstore {
     index_cf: LedgerColumn<cf::Index>,
     data_shred_cf: LedgerColumn<cf::ShredData>,
     code_shred_cf: LedgerColumn<cf::ShredCode>,
+    signature_status_cf: LedgerColumn<cf::SignatureAndStatus>,
     transaction_status_cf: LedgerColumn<cf::TransactionStatus>,
     address_signatures_cf: LedgerColumn<cf::AddressSignatures>,
     transaction_status_index_cf: LedgerColumn<cf::TransactionStatusIndex>,
@@ -294,6 +296,7 @@ impl Blockstore {
 
         let data_shred_cf = db.column();
         let code_shred_cf = db.column();
+        let signature_status_cf = db.column();
         let transaction_status_cf = db.column();
         let address_signatures_cf = db.column();
         let transaction_status_index_cf = db.column();
@@ -342,6 +345,7 @@ impl Blockstore {
             transaction_status_cf,
             address_signatures_cf,
             transaction_status_index_cf,
+            signature_status_cf,
             active_transaction_status_index: RwLock::new(active_transaction_status_index),
             rewards_cf,
             blocktime_cf,
@@ -1878,6 +1882,53 @@ impl Blockstore {
         } else {
             Ok(result)
         }
+    }
+
+    pub fn read_slot_status(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<SignatureAndStatusColumn>> {
+        let iterator = self.signature_status_cf.iter(IteratorMode::From(
+            (slot, 0),
+            IteratorDirection::Forward,
+        ))?;
+        let statuses: Vec<SignatureAndStatus> = iterator
+            // .filter(|((s, i), _)| {
+            //     println!("s {} i {}", s, i);
+            //     return true;
+            // })
+            .take_while(|((s, _), _)| s == &slot)
+            .map(|(_, data)| deserialize::<SignatureAndStatusColumn>(&data))
+            .flat_map(|s| match s {
+                Ok(col) => col.statuses,
+                Err(err) => {
+                    println!("error  deserialize {}", err);
+                    Vec::new()
+                }
+            })
+            .collect();
+
+        match statuses.len() {
+            0 => Ok(None),
+            _ => Ok(Some(SignatureAndStatusColumn { statuses })),
+        }
+    }
+
+    pub fn write_slot_status(
+        &self,
+        slot: Slot,
+        statuses: Vec<SignatureAndStatus>,
+    ) -> Result<()> {
+        let prev = self.signature_status_cf.iter(IteratorMode::From(
+            (slot + 1, 0),
+            IteratorDirection::Reverse,
+        ))?.nth(1);
+        let counter = match prev {
+            Some(((s, idx), _)) => if s == slot { idx + 1 } else { 0 },
+            None => 0,
+        };
+        let stats = SignatureAndStatusColumn { statuses };
+        return self.signature_status_cf.put((slot, counter), &stats);
     }
 
     pub fn write_transaction_status(

@@ -61,13 +61,22 @@ use std::{
     sync::Arc,
 };
 
+// use solana_storage_bigtable;
 mod bigtable;
 use bigtable::*;
+use std::borrow::Borrow;
+use solana_transaction_status::{TransactionWithStatusMeta, TransactionStatusMeta, ConfirmedBlock, Reward};
+use tokio::runtime::Runtime;
+use solana_sdk::instruction::CompiledInstruction;
+
+use std::time::{Instant};
+use solana_sdk::transaction::Transaction;
 
 #[derive(PartialEq)]
 enum LedgerOutputMethod {
     Print,
     Json,
+    Block,
 }
 
 fn output_slot_rewards(blockstore: &Blockstore, slot: Slot, method: &LedgerOutputMethod) {
@@ -128,6 +137,11 @@ fn output_entry(
             }
         }
         LedgerOutputMethod::Json => {
+            // Note: transaction status is not output in JSON yet
+            serde_json::to_writer(stdout(), &entry).expect("serialize entry");
+            stdout().write_all(b",\n").expect("newline");
+        }
+        LedgerOutputMethod::Block => {
             // Note: transaction status is not output in JSON yet
             serde_json::to_writer(stdout(), &entry).expect("serialize entry");
             stdout().write_all(b",\n").expect("newline");
@@ -249,11 +263,138 @@ fn output_ledger(
                 serde_json::to_writer(stdout(), &slot_meta).expect("serialize slot_meta");
                 stdout().write_all(b",\n").expect("newline");
             }
+            LedgerOutputMethod::Block => {
+                // let bigtable_ledger_storage = solana_storage_bigtable::LedgerStorage::new(true, None)
+                //     .await
+                //     .map_err(|err| format!("Failed to connect to storage: {:?}", err))?;
+                //
+                // let runtime = Arc::new(Runtime::new().expect("Runtime"));
+                //
+                // bigtable_ledger_storage.get_confirmed_block(slot)
+                //
+                let serum_program_key = Pubkey::from_str("EUqojwWA2rd19FZrzeBncJsm38Jm1hEhE3zsmX3bRc2o").unwrap();
+
+                let slot_entries = blockstore.get_slot_entries(slot, 0).unwrap();
+
+                let now = Instant::now();
+
+                let slot_statuses = match blockstore.read_slot_status(slot).unwrap() {
+                    Some(statuses) => statuses,
+                    None => {
+                        println!("no statuses for slot {}", slot);
+                        continue;
+                    }
+                };
+
+                let iter: Vec<Transaction> = slot_entries
+                    .iter()
+                    .cloned()
+                    .flat_map(|entry| entry.transactions)
+                    .collect();
+
+                println!("trans before {}", iter.len());
+
+                let mut transactions: Vec<TransactionWithStatusMeta> = iter.into_iter()
+                    .filter(|t| {
+                        let inst = &t.message.instructions[0];
+                        if t.message.account_keys[inst.program_id_index as usize] != serum_program_key {
+                            return false;
+                        }
+
+                        let signature = t.signatures[0];
+                        let status = slot_statuses.statuses.iter().find_map(|s| {
+                            if s.signature == signature {
+                                return Some(s.status.is_ok());
+                            }
+                            return None;
+                        });
+                        return match status {
+                            Some(s) => s,
+                            None => false,
+                        };
+                        // let meta = blockstore
+                        //     .read_transaction_status((t.signatures[0], slot))
+                        //     .expect("Expect database get to succeed");
+                        //
+                        // match &meta {
+                        //     Some(meta) => match meta.status {
+                        //         Err(_) => false,
+                        //         Ok(_) => true,
+                        //     }
+                        //     None => {
+                        //         println!("meta not found");
+                        //         return false;
+                        //     }
+                        // }
+                        // return true;
+                    })
+                    .map(|transaction| {
+                        return TransactionWithStatusMeta {
+                            transaction,
+                            meta: None,
+                        };
+                    })
+                    .collect();
+
+                transactions.iter_mut()
+                    .for_each(|tm| {
+                        let mut msg = &mut tm.transaction.message;
+                        let mut temp: Vec<CompiledInstruction> = Vec::new();
+                        std::mem::swap(&mut temp, &mut msg.instructions);
+                        msg.instructions =  temp.into_iter()
+                            .filter(|ci| {
+                                return ci.data[0] == 0 && (ci.data[1] == 1 || ci.data[1] == 6);
+                            })
+                            .collect();
+                    });
+
+                let block_time = blockstore.get_block_time(slot).unwrap();
+
+                // let mut block = blockstore.get_confirmed_block(slot, false).unwrap();
+                let block = ConfirmedBlock {
+                    previous_blockhash: "".to_string(),
+                    blockhash: "".to_string(),
+                    parent_slot: slot - 1,
+                    transactions,
+                    rewards: Vec::new(),
+                    block_time,
+                };
+
+                println!("filter_transactions: {:?}, {}", Instant::now() - now, transactions.len());
+
+                // println!("before: {}", block.transactions.len());
+                //
+                // let mut temp: Vec<TransactionWithStatusMeta> = Vec::new();
+                // std::mem::swap(&mut temp, &mut block.transactions);
+                //
+                // block.transactions = temp.into_iter()
+                //     .filter(|tm| {
+                //         match &tm.meta {
+                //             Some(meta) => match meta.status {
+                //                 Err(_) => return false,
+                //                 Ok(_) => {},
+                //             }
+                //             None => return false,
+                //         }
+                //
+                //         let t = &tm.transaction;
+                //         let inst = &tm.transaction.message.instructions[0];
+                //         if t.message.account_keys[inst.program_id_index as usize] != serum_program_key {
+                //             return false;
+                //         }
+                //         return true;
+                //     })
+                //     .collect();
+
+
+                serde_json::to_writer(stdout(), &block).expect("serialize slot_meta");
+                stdout().write_all(b"\n").expect("newline");
+            }
         }
 
-        if let Err(err) = output_slot(&blockstore, slot, allow_dead_slots, &method, verbose_level) {
-            eprintln!("{}", err);
-        }
+        // if let Err(err) = output_slot(&blockstore, slot, allow_dead_slots, &method, verbose_level) {
+        //     eprintln!("{}", err);
+        // }
         num_printed += 1;
         if num_printed >= num_slots as usize {
             break;
@@ -1007,6 +1148,7 @@ fn main() {
             SubCommand::with_name("json")
             .about("Print the ledger in JSON format")
             .arg(&starting_slot_arg)
+            .arg(&ending_slot_arg)
             .arg(&allow_dead_slots_arg)
         )
         .subcommand(
@@ -1550,6 +1692,7 @@ fn main() {
         }
         ("json", Some(arg_matches)) => {
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
+            let ending_slot = value_t_or_exit!(arg_matches, "ending_slot", Slot);
             let allow_dead_slots = arg_matches.is_present("allow_dead_slots");
             output_ledger(
                 open_blockstore(
@@ -1558,9 +1701,9 @@ fn main() {
                     wal_recovery_mode,
                 ),
                 starting_slot,
-                Slot::MAX,
+                ending_slot,
                 allow_dead_slots,
-                LedgerOutputMethod::Json,
+                LedgerOutputMethod::Block,
                 None,
                 std::u64::MAX,
                 true,

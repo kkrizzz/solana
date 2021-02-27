@@ -5,7 +5,7 @@ use solana_runtime::{
     bank::{Bank, InnerInstructionsList, NonceRollbackInfo, TransactionLogMessages},
     transaction_utils::OrderedIterator,
 };
-use solana_transaction_status::{InnerInstructions, TransactionStatusMeta};
+use solana_transaction_status::{InnerInstructions, TransactionStatusMeta, TransactionStatus};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,6 +14,8 @@ use std::{
     thread::{self, Builder, JoinHandle},
     time::Duration,
 };
+use solana_runtime::status_cache::SignatureStatus;
+use solana_sdk::transaction::SignatureAndStatus;
 
 pub struct TransactionStatusService {
     thread_hdl: JoinHandle<()>,
@@ -72,6 +74,9 @@ impl TransactionStatusService {
             } else {
                 Box::new(std::iter::repeat_with(Vec::new))
             };
+
+        let mut sigstat: Vec<SignatureAndStatus> = Vec::new();
+
         for (
             (_, transaction),
             (status, nonce_rollback),
@@ -92,52 +97,60 @@ impl TransactionStatusService {
             transaction_logs_iter
         ) {
             if Bank::can_commit(&status) && !transaction.signatures.is_empty() {
-                let fee_calculator = nonce_rollback
-                    .map(|nonce_rollback| nonce_rollback.fee_calculator())
-                    .unwrap_or_else(|| {
-                        bank.get_fee_calculator(&transaction.message().recent_blockhash)
-                    })
-                    .expect("FeeCalculator must exist");
-                let fee = fee_calculator.calculate_fee(transaction.message());
-                let (writable_keys, readonly_keys) =
-                    transaction.message.get_account_keys_by_lock_type();
+                // let fee_calculator = nonce_rollback
+                //     .map(|nonce_rollback| nonce_rollback.fee_calculator())
+                //     .unwrap_or_else(|| {
+                //         bank.get_fee_calculator(&transaction.message().recent_blockhash)
+                //     })
+                //     .expect("FeeCalculator must exist");
+                // let fee = fee_calculator.calculate_fee(transaction.message());
+                // let (writable_keys, readonly_keys) =
+                //     transaction.message.get_account_keys_by_lock_type();
+                //
+                // let inner_instructions = inner_instructions.map(|inner_instructions| {
+                //     inner_instructions
+                //         .into_iter()
+                //         .enumerate()
+                //         .map(|(index, instructions)| InnerInstructions {
+                //             index: index as u8,
+                //             instructions,
+                //         })
+                //         .filter(|i| !i.instructions.is_empty())
+                //         .collect()
+                // });
+                //
+                // let log_messages = Some(log_messages);
+                // let pre_token_balances = Some(pre_token_balances);
+                // let post_token_balances = Some(post_token_balances);
 
-                let inner_instructions = inner_instructions.map(|inner_instructions| {
-                    inner_instructions
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, instructions)| InnerInstructions {
-                            index: index as u8,
-                            instructions,
-                        })
-                        .filter(|i| !i.instructions.is_empty())
-                        .collect()
+                sigstat.push(SignatureAndStatus {
+                    signature: transaction.signatures[0],
+                    status,
                 });
-
-                let log_messages = Some(log_messages);
-                let pre_token_balances = Some(pre_token_balances);
-                let post_token_balances = Some(post_token_balances);
-
-                blockstore
-                    .write_transaction_status(
-                        slot,
-                        transaction.signatures[0],
-                        writable_keys,
-                        readonly_keys,
-                        &TransactionStatusMeta {
-                            status,
-                            fee,
-                            pre_balances,
-                            post_balances,
-                            inner_instructions,
-                            log_messages,
-                            pre_token_balances,
-                            post_token_balances,
-                        },
-                    )
-                    .expect("Expect database write to succeed");
+                //
+                // blockstore
+                //     .write_transaction_status(
+                //         slot,
+                //         transaction.signatures[0],
+                //         writable_keys,
+                //         readonly_keys,
+                //         &TransactionStatusMeta {
+                //             status,
+                //             fee,
+                //             pre_balances,
+                //             post_balances,
+                //             inner_instructions,
+                //             log_messages,
+                //             pre_token_balances,
+                //             post_token_balances,
+                //         },
+                //     )
+                //     .expect("Expect database write to succeed");
             }
         }
+
+        blockstore.write_slot_status(slot, sigstat);
+
         Ok(())
     }
 
