@@ -1678,6 +1678,17 @@ impl Blockstore {
         self.blocktime_cf.get(slot)
     }
 
+    pub fn get_parent_slot(&self, slot: Slot) -> Result<Slot> {
+        let slot_meta_cf = self.db.column::<cf::SlotMeta>();
+        return match slot_meta_cf.get(slot)? {
+            Some(slot_meta) => Ok(slot_meta.parent_slot),
+            None => {
+                info!("SlotMeta not found for rooted slot {}", slot);
+                Err(BlockstoreError::SlotCleanedUp)
+            }
+        }
+    }
+
     pub fn cache_block_time(&self, slot: Slot, timestamp: UnixTimestamp) -> Result<()> {
         if !self.is_root(slot) {
             return Err(BlockstoreError::SlotNotRooted);

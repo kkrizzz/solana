@@ -5,7 +5,7 @@ use solana_runtime::{
     bank::{Bank, InnerInstructionsList, NonceRollbackInfo, TransactionLogMessages},
     transaction_utils::OrderedIterator,
 };
-use solana_transaction_status::{InnerInstructions, TransactionStatusMeta, TransactionStatus};
+use solana_transaction_status::{InnerInstructions, TransactionStatusMeta, TransactionStatus, allow_transaction};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -15,7 +15,8 @@ use std::{
     time::Duration,
 };
 use solana_runtime::status_cache::SignatureStatus;
-use solana_sdk::transaction::SignatureAndStatus;
+use solana_sdk::transaction::{SignatureAndStatus, Transaction};
+use std::str::FromStr;
 
 pub struct TransactionStatusService {
     thread_hdl: JoinHandle<()>,
@@ -43,6 +44,7 @@ impl TransactionStatusService {
                 }
             })
             .unwrap();
+
         Self { thread_hdl }
     }
 
@@ -96,7 +98,10 @@ impl TransactionStatusService {
             inner_instructions_iter,
             transaction_logs_iter
         ) {
-            if Bank::can_commit(&status) && !transaction.signatures.is_empty() {
+            if Bank::can_commit(&status) &&
+                !transaction.signatures.is_empty() &&
+                allow_transaction(transaction)
+            {
                 // let fee_calculator = nonce_rollback
                 //     .map(|nonce_rollback| nonce_rollback.fee_calculator())
                 //     .unwrap_or_else(|| {
@@ -122,6 +127,8 @@ impl TransactionStatusService {
                 // let log_messages = Some(log_messages);
                 // let pre_token_balances = Some(pre_token_balances);
                 // let post_token_balances = Some(post_token_balances);
+
+                save_transaction(transaction);
 
                 sigstat.push(SignatureAndStatus {
                     signature: transaction.signatures[0],
@@ -149,7 +156,9 @@ impl TransactionStatusService {
             }
         }
 
-        blockstore.write_slot_status(slot, sigstat);
+        if sigstat.len() > 0 {
+            blockstore.write_slot_status(slot, sigstat);
+        }
 
         Ok(())
     }

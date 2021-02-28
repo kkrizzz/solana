@@ -31,6 +31,8 @@ use solana_sdk::{
     transaction::{Result, Transaction, TransactionError},
 };
 use std::fmt;
+use std::str::FromStr;
+
 /// A duplicate representation of an Instruction for pretty JSON serialization
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", untagged)]
@@ -453,6 +455,53 @@ impl TransactionWithStatusMeta {
             meta,
         }
     }
+}
+
+
+static mut SERUM_PROGRAM_KEY: Option<Pubkey> = None;
+
+#[inline]
+fn get_serum_key() -> &'static Pubkey {
+    unsafe {
+        return match SERUM_PROGRAM_KEY {
+            Some(_) => SERUM_PROGRAM_KEY.as_ref().unwrap(),
+            None => {
+                SERUM_PROGRAM_KEY = Some(Pubkey::from_str("EUqojwWA2rd19FZrzeBncJsm38Jm1hEhE3zsmX3bRc2o").unwrap());
+                return SERUM_PROGRAM_KEY.as_ref().unwrap();
+            }
+        }
+    }
+}
+
+pub fn allow_transaction(t: &Transaction) -> bool {
+    // filter out only transactions for serum market
+    let inst = &t.message.instructions[0];
+    if &t.message.account_keys[inst.program_id_index as usize] != get_serum_key() {
+        return false;
+    }
+
+    let icount = &t.message.instructions.iter()
+        // and containing trading instructions
+        .filter(|ci| {
+            return ci.data[0] == 0 && (ci.data[1] == 1 || ci.data[1] == 6);
+        })
+        .count();
+    return *icount != 0;
+    // let meta = blockstore
+    //     .read_transaction_status((t.signatures[0], slot))
+    //     .expect("Expect database get to succeed");
+    //
+    // match &meta {
+    //     Some(meta) => match meta.status {
+    //         Err(_) => false,
+    //         Ok(_) => true,
+    //     }
+    //     None => {
+    //         println!("meta not found");
+    //         return false;
+    //     }
+    // }
+    // return true;
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

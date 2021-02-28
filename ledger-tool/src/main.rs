@@ -1,4 +1,5 @@
 #![allow(clippy::integer_arithmetic)]
+
 use clap::{
     crate_description, crate_name, value_t, value_t_or_exit, values_t_or_exit, App, Arg,
     ArgMatches, SubCommand,
@@ -63,9 +64,10 @@ use std::{
 
 // use solana_storage_bigtable;
 mod bigtable;
+
 use bigtable::*;
 use std::borrow::Borrow;
-use solana_transaction_status::{TransactionWithStatusMeta, TransactionStatusMeta, ConfirmedBlock, Reward};
+use solana_transaction_status::{TransactionWithStatusMeta, TransactionStatusMeta, ConfirmedBlock, Reward, UiTransactionEncoding, allow_transaction};
 use tokio::runtime::Runtime;
 use solana_sdk::instruction::CompiledInstruction;
 
@@ -272,11 +274,10 @@ fn output_ledger(
                 //
                 // bigtable_ledger_storage.get_confirmed_block(slot)
                 //
-                let serum_program_key = Pubkey::from_str("EUqojwWA2rd19FZrzeBncJsm38Jm1hEhE3zsmX3bRc2o").unwrap();
+                let now = Instant::now();
 
                 let slot_entries = blockstore.get_slot_entries(slot, 0).unwrap();
 
-                let now = Instant::now();
 
                 let slot_statuses = match blockstore.read_slot_status(slot).unwrap() {
                     Some(statuses) => statuses,
@@ -286,21 +287,18 @@ fn output_ledger(
                     }
                 };
 
+
                 let iter: Vec<Transaction> = slot_entries
                     .iter()
                     .cloned()
                     .flat_map(|entry| entry.transactions)
                     .collect();
 
-                println!("trans before {}", iter.len());
+                let len_before = iter.len();
 
                 let mut transactions: Vec<TransactionWithStatusMeta> = iter.into_iter()
                     .filter(|t| {
-                        let inst = &t.message.instructions[0];
-                        if t.message.account_keys[inst.program_id_index as usize] != serum_program_key {
-                            return false;
-                        }
-
+                        if !allow_transaction(t) { return false; }
                         let signature = t.signatures[0];
                         let status = slot_statuses.statuses.iter().find_map(|s| {
                             if s.signature == signature {
@@ -312,21 +310,6 @@ fn output_ledger(
                             Some(s) => s,
                             None => false,
                         };
-                        // let meta = blockstore
-                        //     .read_transaction_status((t.signatures[0], slot))
-                        //     .expect("Expect database get to succeed");
-                        //
-                        // match &meta {
-                        //     Some(meta) => match meta.status {
-                        //         Err(_) => false,
-                        //         Ok(_) => true,
-                        //     }
-                        //     None => {
-                        //         println!("meta not found");
-                        //         return false;
-                        //     }
-                        // }
-                        // return true;
                     })
                     .map(|transaction| {
                         return TransactionWithStatusMeta {
@@ -336,12 +319,18 @@ fn output_ledger(
                     })
                     .collect();
 
+                if transactions.len() == 0 {
+                    println!("{} skipped: {:?}", slot, Instant::now() - now);
+                }
+
+                let cur_len = transactions.len();
+
                 transactions.iter_mut()
                     .for_each(|tm| {
                         let mut msg = &mut tm.transaction.message;
                         let mut temp: Vec<CompiledInstruction> = Vec::new();
                         std::mem::swap(&mut temp, &mut msg.instructions);
-                        msg.instructions =  temp.into_iter()
+                        msg.instructions = temp.into_iter()
                             .filter(|ci| {
                                 return ci.data[0] == 0 && (ci.data[1] == 1 || ci.data[1] == 6);
                             })
@@ -349,46 +338,26 @@ fn output_ledger(
                     });
 
                 let block_time = blockstore.get_block_time(slot).unwrap();
+                let parent_slot = blockstore.get_parent_slot(slot).unwrap();
 
                 // let mut block = blockstore.get_confirmed_block(slot, false).unwrap();
                 let block = ConfirmedBlock {
                     previous_blockhash: "".to_string(),
                     blockhash: "".to_string(),
-                    parent_slot: slot - 1,
+                    parent_slot,
                     transactions,
                     rewards: Vec::new(),
                     block_time,
                 };
 
-                println!("filter_transactions: {:?}, {}", Instant::now() - now, transactions.len());
 
-                // println!("before: {}", block.transactions.len());
-                //
-                // let mut temp: Vec<TransactionWithStatusMeta> = Vec::new();
-                // std::mem::swap(&mut temp, &mut block.transactions);
-                //
-                // block.transactions = temp.into_iter()
-                //     .filter(|tm| {
-                //         match &tm.meta {
-                //             Some(meta) => match meta.status {
-                //                 Err(_) => return false,
-                //                 Ok(_) => {},
-                //             }
-                //             None => return false,
-                //         }
-                //
-                //         let t = &tm.transaction;
-                //         let inst = &tm.transaction.message.instructions[0];
-                //         if t.message.account_keys[inst.program_id_index as usize] != serum_program_key {
-                //             return false;
-                //         }
-                //         return true;
-                //     })
-                //     .collect();
+                let encoded = block.encode(UiTransactionEncoding::Json);
 
-
-                serde_json::to_writer(stdout(), &block).expect("serialize slot_meta");
+                let file = File::create(format!("./{}.json", slot)).unwrap();
+                serde_json::to_writer(file, &encoded).expect("serialize slot_meta");
                 stdout().write_all(b"\n").expect("newline");
+
+                println!("{} filter_transactions: {:?}, {} -> {}", slot, Instant::now() - now, len_before, cur_len);
             }
         }
 
@@ -519,7 +488,7 @@ fn graph_forks(bank_forks: &BankForks, include_all_votes: bool) -> String {
                         "".to_string()
                     },
                     if let Some((votes, stake, total_stake)) =
-                        slot_stake_and_vote_count.get(&bank.slot())
+                    slot_stake_and_vote_count.get(&bank.slot())
                     {
                         format!(
                             "\nvotes: {}, stake: {:.1} SOL ({:.1}%)",
@@ -540,7 +509,7 @@ fn graph_forks(bank_forks: &BankForks, include_all_votes: bool) -> String {
             match bank.parent() {
                 None => {
                     if bank.slot() > 0 {
-                        dot.push(format!(r#"    "{}" -> "..." [dir=back]"#, bank.slot(),));
+                        dot.push(format!(r#"    "{}" -> "..." [dir=back]"#, bank.slot(), ));
                     }
                     break;
                 }
@@ -863,12 +832,12 @@ fn main() {
     // Ignore SIGUSR1 to prevent long-running calls being killed by logrotate
     // in warehouse deployments
     #[cfg(unix)]
-    {
-        // `register()` is unsafe because the action is called in a signal handler
-        // with the usual caveats. So long as this action body stays empty, we'll
-        // be fine
-        unsafe { signal_hook::register(signal_hook::SIGUSR1, || {}) }.unwrap();
-    }
+        {
+            // `register()` is unsafe because the action is called in a signal handler
+            // with the usual caveats. So long as this action body stays empty, we'll
+            // be fine
+            unsafe { signal_hook::register(signal_hook::SIGUSR1, || {}) }.unwrap();
+        }
 
     const DEFAULT_ROOT_COUNT: &str = "1";
     solana_logger::setup_with_default("solana=info");
@@ -1006,176 +975,176 @@ fn main() {
         .bigtable_subcommand()
         .subcommand(
             SubCommand::with_name("print")
-            .about("Print the ledger")
-            .arg(&starting_slot_arg)
-            .arg(&allow_dead_slots_arg)
-            .arg(&ending_slot_arg)
-            .arg(
-                Arg::with_name("num_slots")
-                    .long("num-slots")
-                    .value_name("SLOT")
-                    .validator(is_slot)
-                    .takes_value(true)
-                    .help("Number of slots to print"),
-            )
-            .arg(
-                Arg::with_name("only_rooted")
-                    .long("only-rooted")
-                    .takes_value(false)
-                    .help("Only print root slots"),
-            )
+                .about("Print the ledger")
+                .arg(&starting_slot_arg)
+                .arg(&allow_dead_slots_arg)
+                .arg(&ending_slot_arg)
+                .arg(
+                    Arg::with_name("num_slots")
+                        .long("num-slots")
+                        .value_name("SLOT")
+                        .validator(is_slot)
+                        .takes_value(true)
+                        .help("Number of slots to print"),
+                )
+                .arg(
+                    Arg::with_name("only_rooted")
+                        .long("only-rooted")
+                        .takes_value(false)
+                        .help("Only print root slots"),
+                )
         )
         .subcommand(
             SubCommand::with_name("copy")
-            .about("Copy the ledger")
-            .arg(&starting_slot_arg)
-            .arg(&ending_slot_arg)
-            .arg(
-                Arg::with_name("target_db")
-                    .long("target-db")
-                    .value_name("PATH")
-                    .takes_value(true)
-                    .help("Target db"),
-            )
+                .about("Copy the ledger")
+                .arg(&starting_slot_arg)
+                .arg(&ending_slot_arg)
+                .arg(
+                    Arg::with_name("target_db")
+                        .long("target-db")
+                        .value_name("PATH")
+                        .takes_value(true)
+                        .help("Target db"),
+                )
         )
         .subcommand(
             SubCommand::with_name("slot")
-            .about("Print the contents of one or more slots")
-            .arg(
-                Arg::with_name("slots")
-                    .index(1)
-                    .value_name("SLOTS")
-                    .validator(is_slot)
-                    .takes_value(true)
-                    .multiple(true)
-                    .required(true)
-                    .help("Slots to print"),
-            )
-            .arg(&allow_dead_slots_arg)
+                .about("Print the contents of one or more slots")
+                .arg(
+                    Arg::with_name("slots")
+                        .index(1)
+                        .value_name("SLOTS")
+                        .validator(is_slot)
+                        .takes_value(true)
+                        .multiple(true)
+                        .required(true)
+                        .help("Slots to print"),
+                )
+                .arg(&allow_dead_slots_arg)
         )
         .subcommand(
             SubCommand::with_name("dead-slots")
-            .arg(&starting_slot_arg)
-            .about("Print all of dead slots")
+                .arg(&starting_slot_arg)
+                .about("Print all of dead slots")
         )
         .subcommand(
             SubCommand::with_name("set-dead-slot")
-            .about("Mark one or more slots dead")
-            .arg(
-                Arg::with_name("slots")
-                    .index(1)
-                    .value_name("SLOTS")
-                    .validator(is_slot)
-                    .takes_value(true)
-                    .multiple(true)
-                    .required(true)
-                    .help("Slots to mark dead"),
-            )
+                .about("Mark one or more slots dead")
+                .arg(
+                    Arg::with_name("slots")
+                        .index(1)
+                        .value_name("SLOTS")
+                        .validator(is_slot)
+                        .takes_value(true)
+                        .multiple(true)
+                        .required(true)
+                        .help("Slots to mark dead"),
+                )
         )
         .subcommand(
             SubCommand::with_name("genesis")
-            .about("Prints the ledger's genesis config")
-            .arg(&max_genesis_archive_unpacked_size_arg)
+                .about("Prints the ledger's genesis config")
+                .arg(&max_genesis_archive_unpacked_size_arg)
         )
         .subcommand(
             SubCommand::with_name("parse_full_frozen")
-            .about("Parses log for information about critical events about ancestors of the given `ending_slot`")
-            .arg(&starting_slot_arg)
-            .arg(&ending_slot_arg)
-            .arg(
-                Arg::with_name("log_path")
-                    .long("log-path")
-                    .value_name("PATH")
-                    .takes_value(true)
-                    .help("path to log file to parse"),
-            )
+                .about("Parses log for information about critical events about ancestors of the given `ending_slot`")
+                .arg(&starting_slot_arg)
+                .arg(&ending_slot_arg)
+                .arg(
+                    Arg::with_name("log_path")
+                        .long("log-path")
+                        .value_name("PATH")
+                        .takes_value(true)
+                        .help("path to log file to parse"),
+                )
         )
         .subcommand(
             SubCommand::with_name("genesis-hash")
-            .about("Prints the ledger's genesis hash")
-            .arg(&max_genesis_archive_unpacked_size_arg)
+                .about("Prints the ledger's genesis hash")
+                .arg(&max_genesis_archive_unpacked_size_arg)
         )
         .subcommand(
             SubCommand::with_name("modify-genesis")
-            .about("Modifies genesis parameters")
-            .arg(&max_genesis_archive_unpacked_size_arg)
-            .arg(&hashes_per_tick)
-            .arg(
-                Arg::with_name("cluster_type")
-                    .long("cluster-type")
-                    .possible_values(&ClusterType::STRINGS)
-                    .takes_value(true)
-                    .help(
-                        "Selects the features that will be enabled for the cluster"
-                    ),
-            )
-            .arg(
-                Arg::with_name("output_directory")
-                    .index(1)
-                    .value_name("DIR")
-                    .takes_value(true)
-                    .help("Output directory for the modified genesis config"),
-            )
+                .about("Modifies genesis parameters")
+                .arg(&max_genesis_archive_unpacked_size_arg)
+                .arg(&hashes_per_tick)
+                .arg(
+                    Arg::with_name("cluster_type")
+                        .long("cluster-type")
+                        .possible_values(&ClusterType::STRINGS)
+                        .takes_value(true)
+                        .help(
+                            "Selects the features that will be enabled for the cluster"
+                        ),
+                )
+                .arg(
+                    Arg::with_name("output_directory")
+                        .index(1)
+                        .value_name("DIR")
+                        .takes_value(true)
+                        .help("Output directory for the modified genesis config"),
+                )
         )
         .subcommand(
             SubCommand::with_name("shred-version")
-            .about("Prints the ledger's shred hash")
-            .arg(&hard_forks_arg)
-            .arg(&max_genesis_archive_unpacked_size_arg)
+                .about("Prints the ledger's shred hash")
+                .arg(&hard_forks_arg)
+                .arg(&max_genesis_archive_unpacked_size_arg)
         )
         .subcommand(
             SubCommand::with_name("shred-meta")
-            .about("Prints raw shred metadata")
-            .arg(&starting_slot_arg)
-            .arg(&ending_slot_arg)
+                .about("Prints raw shred metadata")
+                .arg(&starting_slot_arg)
+                .arg(&ending_slot_arg)
         )
         .subcommand(
             SubCommand::with_name("bank-hash")
-            .about("Prints the hash of the working bank after reading the ledger")
-            .arg(&max_genesis_archive_unpacked_size_arg)
+                .about("Prints the hash of the working bank after reading the ledger")
+                .arg(&max_genesis_archive_unpacked_size_arg)
         )
         .subcommand(
             SubCommand::with_name("bounds")
-            .about("Print lowest and highest non-empty slots. Note that there may be empty slots within the bounds")
-            .arg(
-                Arg::with_name("all")
-                    .long("all")
-                    .takes_value(false)
-                    .required(false)
-                    .help("Additionally print all the non-empty slots within the bounds"),
-            )
+                .about("Print lowest and highest non-empty slots. Note that there may be empty slots within the bounds")
+                .arg(
+                    Arg::with_name("all")
+                        .long("all")
+                        .takes_value(false)
+                        .required(false)
+                        .help("Additionally print all the non-empty slots within the bounds"),
+                )
         ).subcommand(
-            SubCommand::with_name("json")
+        SubCommand::with_name("json")
             .about("Print the ledger in JSON format")
             .arg(&starting_slot_arg)
             .arg(&ending_slot_arg)
             .arg(&allow_dead_slots_arg)
-        )
+    )
         .subcommand(
             SubCommand::with_name("verify")
-            .about("Verify the ledger")
-            .arg(&no_snapshot_arg)
-            .arg(&account_paths_arg)
-            .arg(&halt_at_slot_arg)
-            .arg(&hard_forks_arg)
-            .arg(&no_accounts_db_caching_arg)
-            .arg(&bpf_jit_arg)
-            .arg(&allow_dead_slots_arg)
-            .arg(&max_genesis_archive_unpacked_size_arg)
-            .arg(
-                Arg::with_name("skip_poh_verify")
-                    .long("skip-poh-verify")
-                    .takes_value(false)
-                    .help("Skip ledger PoH verification"),
-            )
-            .arg(
-                Arg::with_name("print_accounts_stats")
-                    .long("print-accounts-stats")
-                    .takes_value(false)
-                    .help("After verifying the ledger, print some information about the account stores."),
-            )
+                .about("Verify the ledger")
+                .arg(&no_snapshot_arg)
+                .arg(&account_paths_arg)
+                .arg(&halt_at_slot_arg)
+                .arg(&hard_forks_arg)
+                .arg(&no_accounts_db_caching_arg)
+                .arg(&bpf_jit_arg)
+                .arg(&allow_dead_slots_arg)
+                .arg(&max_genesis_archive_unpacked_size_arg)
+                .arg(
+                    Arg::with_name("skip_poh_verify")
+                        .long("skip-poh-verify")
+                        .takes_value(false)
+                        .help("Skip ledger PoH verification"),
+                )
+                .arg(
+                    Arg::with_name("print_accounts_stats")
+                        .long("print-accounts-stats")
+                        .takes_value(false)
+                        .help("After verifying the ledger, print some information about the account stores."),
+                )
         ).subcommand(
-            SubCommand::with_name("graph")
+        SubCommand::with_name("graph")
             .about("Create a Graphviz rendering of the ledger")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
@@ -1194,8 +1163,8 @@ fn main() {
                     .takes_value(true)
                     .help("Output file"),
             )
-        ).subcommand(
-            SubCommand::with_name("create-snapshot")
+    ).subcommand(
+        SubCommand::with_name("create-snapshot")
             .about("Create a new ledger snapshot")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
@@ -1310,8 +1279,8 @@ fn main() {
                     .takes_value(false)
                     .help("Remove all existing stake accounts from the new snapshot.")
             )
-        ).subcommand(
-            SubCommand::with_name("accounts")
+    ).subcommand(
+        SubCommand::with_name("accounts")
             .about("Print account contents after processing in the ledger")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
@@ -1330,8 +1299,8 @@ fn main() {
                     .help("Exclude account data (useful for large number of accounts)"),
             )
             .arg(&max_genesis_archive_unpacked_size_arg)
-        ).subcommand(
-            SubCommand::with_name("capitalization")
+    ).subcommand(
+        SubCommand::with_name("capitalization")
             .about("Print capitalization (aka, total suppy) while checksumming it")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
@@ -1385,8 +1354,8 @@ fn main() {
                     .takes_value(true)
                     .help("Output file in the csv format"),
             )
-        ).subcommand(
-            SubCommand::with_name("purge")
+    ).subcommand(
+        SubCommand::with_name("purge")
             .about("Delete a range of slots from the ledger.")
             .arg(
                 Arg::with_name("start_slot")
@@ -1424,41 +1393,41 @@ fn main() {
                     .takes_value(false)
                     .help("Limit purging to dead slots only")
             )
-        )
+    )
         .subcommand(
             SubCommand::with_name("list-roots")
-            .about("Output up to last <num-roots> root hashes and their heights starting at the given block height")
-            .arg(
-                Arg::with_name("max_height")
-                    .long("max-height")
-                    .value_name("NUM")
-                    .takes_value(true)
-                    .help("Maximum block height")
-            )
-            .arg(
-                Arg::with_name("start_root")
-                    .long("start-root")
-                    .value_name("NUM")
-                    .takes_value(true)
-                    .help("First root to start searching from")
-            )
-            .arg(
-                Arg::with_name("slot_list")
-                    .long("slot-list")
-                    .value_name("FILENAME")
-                    .required(false)
-                    .takes_value(true)
-                    .help("The location of the output YAML file. A list of rollback slot heights and hashes will be written to the file.")
-            )
-            .arg(
-                Arg::with_name("num_roots")
-                    .long("num-roots")
-                    .value_name("NUM")
-                    .takes_value(true)
-                    .default_value(DEFAULT_ROOT_COUNT)
-                    .required(false)
-                    .help("Number of roots in the output"),
-            )
+                .about("Output up to last <num-roots> root hashes and their heights starting at the given block height")
+                .arg(
+                    Arg::with_name("max_height")
+                        .long("max-height")
+                        .value_name("NUM")
+                        .takes_value(true)
+                        .help("Maximum block height")
+                )
+                .arg(
+                    Arg::with_name("start_root")
+                        .long("start-root")
+                        .value_name("NUM")
+                        .takes_value(true)
+                        .help("First root to start searching from")
+                )
+                .arg(
+                    Arg::with_name("slot_list")
+                        .long("slot-list")
+                        .value_name("FILENAME")
+                        .required(false)
+                        .takes_value(true)
+                        .help("The location of the output YAML file. A list of rollback slot heights and hashes will be written to the file.")
+                )
+                .arg(
+                    Arg::with_name("num_roots")
+                        .long("num-roots")
+                        .value_name("NUM")
+                        .takes_value(true)
+                        .default_value(DEFAULT_ROOT_COUNT)
+                        .required(false)
+                        .help("Number of roots in the output"),
+                )
         )
         .subcommand(
             SubCommand::with_name("analyze-storage")
@@ -1564,10 +1533,10 @@ fn main() {
                 solana_runtime::hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
                 AccessType::PrimaryOnly,
             )
-            .unwrap_or_else(|err| {
-                eprintln!("Failed to write genesis config: {:?}", err);
-                exit(1);
-            });
+                .unwrap_or_else(|err| {
+                    eprintln!("Failed to write genesis config: {:?}", err);
+                    exit(1);
+                });
 
             println!("{}", open_genesis_config_by(&output_directory, arg_matches));
         }
@@ -1593,7 +1562,7 @@ fn main() {
                         "{}",
                         compute_shred_version(
                             &genesis_config.hash(),
-                            Some(&bank_forks.working_bank().hard_forks().read().unwrap())
+                            Some(&bank_forks.working_bank().hard_forks().read().unwrap()),
                         )
                     );
                 }
@@ -1824,10 +1793,10 @@ fn main() {
                 wal_recovery_mode,
                 snapshot_archive_path,
             )
-            .unwrap_or_else(|err| {
-                eprintln!("Ledger verification failed: {:?}", err);
-                exit(1);
-            });
+                .unwrap_or_else(|err| {
+                    eprintln!("Ledger verification failed: {:?}", err);
+                    exit(1);
+                });
             if print_accounts_stats {
                 let working_bank = bank_forks.working_bank();
                 working_bank.print_accounts_stats();
@@ -2110,10 +2079,10 @@ fn main() {
                         ArchiveFormat::TarZstd,
                         None,
                     )
-                    .unwrap_or_else(|err| {
-                        eprintln!("Unable to create snapshot: {}", err);
-                        exit(1);
-                    });
+                        .unwrap_or_else(|err| {
+                            eprintln!("Unable to create snapshot: {}", err);
+                            exit(1);
+                        });
 
                     println!(
                         "Successfully created snapshot for slot {}, hash {}: {}",
@@ -2125,7 +2094,7 @@ fn main() {
                         "Shred version: {}",
                         compute_shred_version(
                             &genesis_config.hash(),
-                            Some(&bank.hard_forks().read().unwrap())
+                            Some(&bank.hard_forks().read().unwrap()),
                         )
                     );
                 }
@@ -2439,7 +2408,7 @@ fn main() {
                                     ) => {
                                         if *points > 0 {
                                             detail.epochs += 1;
-                                            detail.points.push(PointDetail {epoch: *epoch, points: *points, stake: *stake, credits: *credits});
+                                            detail.points.push(PointDetail { epoch: *epoch, points: *points, stake: *stake, credits: *credits });
                                         }
                                     }
                                     InflationPointCalculationEvent::SplitRewards(
@@ -2457,7 +2426,7 @@ fn main() {
                                         let point_value = detail.point_value.clone();
                                         if point_value.is_some() {
                                             if last_point_value.is_some() {
-                                                assert_eq!(last_point_value, point_value,);
+                                                assert_eq!(last_point_value, point_value, );
                                             }
                                             last_point_value = point_value;
                                         }
